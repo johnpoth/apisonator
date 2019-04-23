@@ -9,25 +9,27 @@ module ThreeScale
     # this stripping is that the resque one does fork before processing each job, and that
     # is too slow.
 
-    class Worker
+    # This is a module that's meant to be included from the different workers.
+    # Now we have WorkerSync and WorkerAsync. Those classes need to implement
+    # #work, which is responsible for fetching jobs from the queue and running
+    # them by calling perform(job).
+    module Worker
       include Resque::Helpers
       include Configurable
-
-      # the order is relevant
-      QUEUES = [:priority, :main, :stats]
-      REDIS_TIMEOUT = 60
-
-      def initialize(options)
-        trap('TERM') { shutdown }
-        trap('INT')  { shutdown }
-
-        @one_off = options[:one_off]
-      end
 
       def self.new(options = {})
         Logging::Worker.configure_logging(self, options[:log_file])
         Logging::External.setup_worker
-        super
+
+        if options[:async]
+          # Conditional require is done to require async-* libs only when
+          # needed and avoid possible side-effects.
+          require '3scale/backend/worker_async'
+          WorkerAsync.new(options)
+        else
+          require '3scale/backend/worker_sync'
+          WorkerSync.new(options)
+        end
       end
 
       # == Options
@@ -36,22 +38,12 @@ module ThreeScale
       #
       def self.work(options = {})
         Process.setproctitle("3scale_backend_worker #{Backend::VERSION}")
+        options[:async] = configuration.redis.async
         new(options).work
       end
 
       def work
-        register_worker
-
-        loop do
-          break if @shutdown
-
-          job = reserve
-          perform(job) if job
-
-          break if one_off?
-        end
-
-        unregister_worker
+        raise 'Missing implementation of #work'
       end
 
       def shutdown
@@ -59,7 +51,7 @@ module ThreeScale
       end
 
       def to_s
-        @to_s ||= "#{hostname}:#{Process.pid}:#{QUEUES.join(',')}"
+        @to_s ||= "#{hostname}:#{Process.pid}"
       end
 
       def one_off?
@@ -67,35 +59,6 @@ module ThreeScale
       end
 
       private
-
-      def reserve
-        @queues ||= QUEUES.map { |q| "queue:#{q}" }
-        encoded_job = redis.blpop(*@queues, timeout: redis_timeout)
-
-        return nil if encoded_job.nil? || encoded_job.empty?
-
-        begin
-          # Resque::Job.new accepts a queue name as a param. It is very
-          # important to set here the same name as the one we set when calling
-          # Resque.enqueue. Resque.enqueue uses the @queue ivar in
-          # BackgroundJob classes as the name of the queue, and then, it stores
-          # the job in a queue called resque:queue:_@queue_. 'resque:' is the
-          # namespace and 'queue:' is added automatically. That's why we need
-          # to call blpop on 'queue:#{q}' above. However, when creating the job
-          # we cannot set 'queue:#{q}' as the name. Otherwise, if it fails and
-          # it is re-queued, it will end up in resque:queue:queue:_@queue_
-          # instead of resque:queue:_@queue_.
-          encoded_job[0].sub!('queue:', '')
-          Resque::Job.new(encoded_job[0],
-                          Yajl::Parser.parse(encoded_job[1], check_utf8: false))
-        rescue Exception => e
-          # I think that the only exception that can be raised here is
-          # Yajl::ParseError. However, this is a critical part of the code so
-          # we will capture all of them just to be safe.
-          Worker.logger.notify(e)
-          nil
-        end
-      end
 
       def perform(job)
         job.perform
@@ -109,10 +72,6 @@ module ThreeScale
 
       def unregister_worker
         redis.srem(:workers, self)
-      end
-
-      def redis_timeout
-        REDIS_TIMEOUT
       end
 
       def hostname
